@@ -1,57 +1,107 @@
 package at.lukli.forceloadmod;
 
-import org.slf4j.Logger;
+import java.util.List;
 
-import com.mojang.logging.LogUtils;
-
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.SectionPos;
+import net.minecraft.server.level.ForcedChunksSavedData;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.GameRules;
+import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.chunk.LevelChunkSection;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.material.FluidState;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.Mod;
 import net.neoforged.fml.config.ModConfig;
 import net.neoforged.fml.ModContainer;
-import net.neoforged.fml.event.lifecycle.FMLCommonSetupEvent;
 import net.neoforged.neoforge.common.NeoForge;
-import net.neoforged.neoforge.event.BuildCreativeModeTabContentsEvent;
-import net.neoforged.neoforge.event.server.ServerStartingEvent;
+import net.neoforged.neoforge.event.tick.LevelTickEvent;
 
-// The value here should match an entry in the META-INF/neoforge.mods.toml file
 @Mod(EnhancedForceloadMod.MOD_ID)
 public class EnhancedForceloadMod {
-    // Define mod id in a common place for everything to reference
     public static final String MOD_ID = "enhancedforceloadmod";
-    // Directly reference a slf4j logger
-    public static final Logger LOGGER = LogUtils.getLogger();
 
-    // The constructor for the mod class is the first code that is run when your mod is loaded.
-    // FML will recognize some parameter types like IEventBus or ModContainer and pass them in automatically.
     public EnhancedForceloadMod(IEventBus modEventBus, ModContainer modContainer) {
-        // Register the commonSetup method for modloading
-        modEventBus.addListener(this::commonSetup);
-
-        // Register ourselves for server and other game events we are interested in.
-        // Note that this is necessary if and only if we want *this* class (ExampleMod) to respond directly to events.
-        // Do not add this line if there are no @SubscribeEvent-annotated functions in this class, like onServerStarting() below.
         NeoForge.EVENT_BUS.register(this);
-
-        // Register the item to a creative tab
-        modEventBus.addListener(this::addCreative);
-
-        // Register our mod's ModConfigSpec so that FML can create and load the config file for us
         modContainer.registerConfig(ModConfig.Type.COMMON, Config.SPEC);
     }
 
-    private void commonSetup(FMLCommonSetupEvent event) {
-
-    }
-
-    // Add the example block item to the building blocks tab
-    private void addCreative(BuildCreativeModeTabContentsEvent event) {
-
-    }
-
-    // You can use SubscribeEvent and let the Event Bus discover methods to call
     @SubscribeEvent
-    public void onServerStarting(ServerStartingEvent event) {
+    public void onLevelTick(LevelTickEvent.Post event) {
+        if (!Config.ENABLE_RANDOM_TICKS.get()) return;
+        if (!(event.getLevel() instanceof ServerLevel serverLevel)) return;
 
+        int randomTickSpeed = serverLevel.getGameRules().getInt(GameRules.RULE_RANDOMTICKING);
+        if (randomTickSpeed <= 0) return;
+
+        // Only fetch forced-chunk data when chunks are actually registered
+        ForcedChunksSavedData forcedData = serverLevel.getDataStorage().get(
+                ForcedChunksSavedData.factory(), "chunks");
+        if (forcedData == null) return;
+
+        if (forcedData.getChunks().isEmpty()) return;
+
+        // Vanilla already random-ticks chunks within simulation distance of a player.
+        // We only tick forced chunks that are *outside* that range to avoid double-ticking.
+        int simDistance = serverLevel.getServer().getPlayerList().getSimulationDistance();
+
+        // Pre-compute player chunk positions once per tick to avoid O(forced * players) repeated calls.
+        List<ChunkPos> playerChunkPositions = serverLevel.players().stream()
+                .map(ServerPlayer::chunkPosition)
+                .toList();
+
+        for (long packedPos : forcedData.getChunks()) {
+            ChunkPos chunkPos = new ChunkPos(packedPos);
+
+            boolean alreadyTicked = false;
+            for (ChunkPos playerChunk : playerChunkPositions) {
+                if (chunkPos.getChessboardDistance(playerChunk) <= simDistance) {
+                    alreadyTicked = true;
+                    break;
+                }
+            }
+            if (alreadyTicked) continue;
+
+            LevelChunk chunk = serverLevel.getChunkSource().getChunkNow(chunkPos.x, chunkPos.z);
+            if (chunk == null) continue;
+
+            tickChunkRandomly(serverLevel, chunk, chunkPos, randomTickSpeed);
+        }
+    }
+
+    private static void tickChunkRandomly(ServerLevel level, LevelChunk chunk, ChunkPos chunkPos, int randomTickSpeed) {
+        LevelChunkSection[] sections = chunk.getSections();
+        BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
+        for (int sectionIndex = 0; sectionIndex < sections.length; sectionIndex++) {
+            LevelChunkSection section = sections[sectionIndex];
+            if (!section.isRandomlyTicking()) continue;
+
+            int minBlockY = SectionPos.sectionToBlockCoord(chunk.getSectionYFromSectionIndex(sectionIndex));
+
+            for (int i = 0; i < randomTickSpeed; i++) {
+                int localX = level.random.nextInt(16);
+                int localY = level.random.nextInt(16);
+                int localZ = level.random.nextInt(16);
+
+                mutablePos.set(
+                        chunkPos.getMinBlockX() + localX,
+                        minBlockY + localY,
+                        chunkPos.getMinBlockZ() + localZ);
+
+                BlockState blockState = section.getBlockState(localX, localY, localZ);
+                if (blockState.isRandomlyTicking()) {
+                    blockState.randomTick(level, mutablePos, level.random);
+                }
+
+                FluidState fluidState = section.getFluidState(localX, localY, localZ);
+                if (fluidState.isRandomlyTicking()) {
+                    fluidState.randomTick(level, mutablePos, level.random);
+                }
+            }
+        }
     }
 }
